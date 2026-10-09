@@ -33,14 +33,15 @@ classifiers = [
 dependencies = [
     "pyjpegio>=0.3.0",
     "numpy",
-    "torch"
+    "torch",
+    "Pillow",
+    "lpips",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.9",
-    "Pillow",
 ]
 
 [project.scripts]
