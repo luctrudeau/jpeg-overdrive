@@ -30,12 +30,17 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
-dependencies = []
+dependencies = [
+    "pyjpegio>=0.3.0",
+    "numpy",
+    "torch"
+]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.9",
+    "Pillow",
 ]
 
 [project.scripts]
