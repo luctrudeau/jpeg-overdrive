@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jpeg-overdrive"
+version = "0.1.0"
+description = "JPEG-compliant perceptual image compression through gradient-based rate-distortion optimization."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+
+authors = [
+    { name = "Luc Trudeau" },
+]
+
+keywords = [
+    "jpeg",
+    "image-compression",
+    "perceptual-compression",
+    "rate-distortion",
+    "optimization",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+jpeg-overdrive = "jpegoverdrive.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/luctrudeau/jpeg-overdrive"
+Repository = "https://github.com/luctrudeau/jpeg-overdrive"
+Issues = "https://github.com/luctrudeau/jpeg-overdrive/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
