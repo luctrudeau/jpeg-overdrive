@@ -23,8 +23,6 @@ import torch
 from PIL import Image
 
 from jpegoverdrive.decoder import (
-    blocks_to_image,
-    coef_array_to_blocks,
     decode_component,
     decode_jpeg_rgb,
 )
@@ -95,39 +93,6 @@ def test_decoder_matches_reference(tmp_path, source_image, quality, image_type):
 
     assert mae < 0.01
     assert max_error <= 1.0
-
-
-def test_coef_array_to_blocks():
-    """Verify coefficient block ordering."""
-    coefficients = torch.arange(256).reshape(16, 16)
-
-    blocks = coef_array_to_blocks(coefficients)
-
-    print(f"\nCoefficient layout: {tuple(coefficients.shape)}")
-    print(f"Block layout:       {tuple(blocks.shape)}")
-
-    assert blocks.shape == (2, 2, 8, 8)
-
-    torch.testing.assert_close(blocks[0, 0], coefficients[:8, :8])
-    torch.testing.assert_close(blocks[0, 1], coefficients[:8, 8:])
-    torch.testing.assert_close(blocks[1, 0], coefficients[8:, :8])
-    torch.testing.assert_close(blocks[1, 1], coefficients[8:, 8:])
-
-
-def test_blocks_to_image():
-    """Verify that block conversion is reversible."""
-    image = torch.arange(256).reshape(16, 16)
-
-    blocks = coef_array_to_blocks(image)
-    reconstructed = blocks_to_image(blocks)
-
-    print(
-        f"\nBlock round-trip: "
-        f"{tuple(image.shape)} -> {tuple(blocks.shape)} "
-        f"-> {tuple(reconstructed.shape)}"
-    )
-
-    torch.testing.assert_close(reconstructed, image)
 
 
 def test_decode_component_dc_only():

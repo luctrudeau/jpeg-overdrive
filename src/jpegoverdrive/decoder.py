@@ -22,40 +22,11 @@ from jpegoverdrive.dct import (
     ISLOW_PASS1_BITS,
     idct_islow_1d,
 )
-
-
-def ste_round(x: torch.Tensor) -> torch.Tensor:
-    """Round values in the forward pass while preserving unit gradients."""
-    return x + (torch.round(x) - x).detach()
-
-
-def coef_array_to_blocks(coef: torch.Tensor) -> torch.Tensor:
-    """Convert jpegio's coefficient array to 8x8 DCT blocks.
-
-    Args:
-        coef: Coefficient array with shape (H, W), where both
-            dimensions are multiples of 8.
-
-    Returns:
-        Tensor with shape (H // 8, W // 8, 8, 8).
-    """
-    height, width = coef.shape
-
-    return coef.reshape(height // 8, 8, width // 8, 8).permute(0, 2, 1, 3)
-
-
-def blocks_to_image(blocks: torch.Tensor) -> torch.Tensor:
-    """Reassemble 8x8 blocks into a two-dimensional image.
-
-    Args:
-        blocks: Tensor with shape (block_rows, block_cols, 8, 8).
-
-    Returns:
-        Tensor with shape (block_rows * 8, block_cols * 8).
-    """
-    block_rows, block_cols = blocks.shape[:2]
-
-    return blocks.permute(0, 2, 1, 3).reshape(block_rows * 8, block_cols * 8)
+from jpegoverdrive.utils import (
+    array_to_blocks,
+    blocks_to_array,
+    ste_round,
+)
 
 
 def decode_component(
@@ -90,7 +61,7 @@ def decode_component(
     )
 
     # Reassemble blocks and apply the JPEG level shift.
-    return torch.clamp(blocks_to_image(blocks) + 128.0, 0.0, 255.0)
+    return torch.clamp(blocks_to_array(blocks) + 128.0, 0.0, 255.0)
 
 
 def ycbcr_to_rgb(
@@ -158,7 +129,7 @@ def decode_jpeg_components(
             device=device,
         )
 
-        qcoeff = coef_array_to_blocks(coef_array)
+        qcoeff = array_to_blocks(coef_array)
 
         qtable = torch.as_tensor(
             jpeg.quant_tables[component.quant_tbl_no],
