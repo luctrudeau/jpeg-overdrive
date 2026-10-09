@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: en-US
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: false
+  poem: false
+  review_status: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+
+    # Review PRs targeting any branch, including milestone branches.
+    base_branches:
+      - ".*"
+
+  path_instructions:
+    - path: "src/jpegoverdrive/**/*.py"
+      instructions: |
+        JPEG Overdrive is a research encoder that uses gradient-based
+        optimization to produce standard-compliant JPEG bitstreams.
+
+        Prioritize correctness over style.
+
+        Focus on:
+        - Numerical correctness and floating-point stability.
+        - PyTorch autograd and straight-through estimators.
+        - Gradient propagation through quantization and decoding.
+        - Correct handling of shared quantization tables.
+        - JPEG bitstream compliance and coefficient constraints.
+        - Rate-distortion objectives and normalization.
+        - Reproducibility and deterministic initialization.
+        - Memory usage and computational efficiency.
+
+        Report concrete bugs with actionable fixes.
+        Avoid speculative issues and minor stylistic suggestions.
+
+    - path: "tests/**/*.py"
+      instructions: |
+        Verify that tests exercise meaningful behavior.
+
+        Focus on:
+        - Numerical regression coverage.
+        - Edge cases and invalid inputs.
+        - Correct assertions and test isolation.
+        - Determinism and reproducibility.
+        - Missing tests for newly introduced behavior.
+
+        Avoid requesting redundant tests when existing coverage
+        already validates the behavior.
