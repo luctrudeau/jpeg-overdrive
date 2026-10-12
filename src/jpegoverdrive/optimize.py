@@ -64,6 +64,25 @@ def extract_jpeg_state(
     return state
 
 
+def prepare_metrics(
+    metric: torch.nn.Module | dict[str, torch.nn.Module],
+) -> None:
+    """Validate and freeze perceptual metrics."""
+    if isinstance(metric, dict):
+        if set(metric) != {"alex", "vgg"}:
+            raise ValueError("Joint optimization requires 'alex' and 'vgg' metrics.")
+
+        metrics = metric.values()
+    else:
+        metrics = (metric,)
+
+    for model in metrics:
+        model.eval()
+
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+
+
 def validate_initial_state(
     initial_state: list[dict],
     jpeg: jio.DecompressedJpeg,
@@ -287,41 +306,109 @@ def tensor_rgb_to_lpips(image: torch.Tensor) -> torch.Tensor:
 def compute_objectives(
     state: list[dict],
     reference: ImageReference,
-    metric: torch.nn.Module,
-    initial_distortion: torch.Tensor,
+    metric: torch.nn.Module | dict[str, torch.nn.Module],
+    initial_distortion: torch.Tensor | dict[str, float],
     initial_rate: torch.Tensor,
     height: int,
     width: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute normalized perceptual distortion and rate proxy."""
+    *,
+    return_details: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
+):
+    """Compute differentiable normalized distortion and rate objectives.
+
+    For joint LPIPS optimization, distortion is the maximum of the
+    independently normalized Alex and VGG scores.
+
+    Args:
+        state: Trainable JPEG representation.
+        reference: Cached source image representations.
+        metric: Single LPIPS network or an Alex/VGG metric dictionary.
+        initial_distortion: Normalization scales for perceptual distortion.
+        initial_rate: Normalization scale for the differentiable rate proxy.
+        height: Image height in pixels.
+        width: Image width in pixels.
+        return_details: Include individual normalized LPIPS scores.
+
+    Returns:
+        Normalized distortion and rate. When return_details is True,
+        also returns a dictionary containing individual normalized
+        distortions for joint optimization.
+    """
     rgb = decode_jpeg_state(state, height, width)
 
     rgb_lpips = tensor_rgb_to_lpips(rgb)
 
-    distortion = metric(
-        reference.lpips,
-        rgb_lpips,
-    ).mean()
+    if isinstance(metric, dict):
+        d_alex = (
+            metric["alex"](reference.lpips, rgb_lpips).mean()
+            / initial_distortion["alex"]
+        )
 
-    rate = jpeg_rate_proxy(state)
+        d_vgg = (
+            metric["vgg"](reference.lpips, rgb_lpips).mean() / initial_distortion["vgg"]
+        )
 
-    return (
-        distortion / initial_distortion,
-        rate / initial_rate,
-    )
+        distortion = torch.maximum(d_alex, d_vgg)
+    else:
+        distortion = metric(reference.lpips, rgb_lpips).mean() / initial_distortion
+
+    rate = jpeg_rate_proxy(state) / initial_rate
+
+    if return_details:
+        details = {}
+
+        if isinstance(metric, dict):
+            details = {
+                "alex_norm": d_alex,
+                "vgg_norm": d_vgg,
+            }
+
+        return distortion, rate, details
+
+    return distortion, rate
 
 
 def select_best_candidate(
     history: list[dict],
     baseline: dict,
+    nets: tuple[str, ...] = ("alex",),
 ) -> dict:
-    """Select the lowest-LPIPS JPEG at or below the baseline size.
+    """Select the best JPEG without exceeding the baseline file size.
 
-    The original baseline always remains eligible.
+    Single-network selection minimizes LPIPS. Joint selection minimizes
+    the maximum independently normalized Alex and VGG scores, using
+    actual JPEG measurements.
 
-    If two candidates have equal LPIPS, the smaller file wins.
-    Only exported snapshots are considered.
+    The baseline remains eligible, and smaller files win ties.
+
+        Raises:
+            ValueError: If joint selection is requested but the baseline
+                or any candidate is missing its VGG LPIPS measurement.
     """
+
+    if len(nets) > 1:
+        if "lpips_vgg" not in baseline:
+            raise ValueError("Joint selection requires 'lpips_vgg' in the baseline.")
+
+        for i, candidate in enumerate(history):
+            if "lpips_vgg" not in candidate:
+                raise ValueError(
+                    f"Joint selection requires 'lpips_vgg' in candidate {i}."
+                )
+
+    def score(row: dict) -> float:
+        """Score a JPEG using single or worst-case normalized LPIPS."""
+        if len(nets) == 1:
+            return row["lpips"]
+
+        return max(
+            row["lpips"] / max(baseline["lpips"], DISTORTION_FLOOR),
+            row["lpips_vgg"] / max(baseline["lpips_vgg"], DISTORTION_FLOOR),
+        )
+
     best = {
         **baseline,
         "step": None,
@@ -329,7 +416,7 @@ def select_best_candidate(
     }
 
     for candidate in history:
-        distortion = float(candidate["lpips"])
+        distortion = score(candidate)
 
         if not math.isfinite(distortion):
             continue
@@ -341,7 +428,7 @@ def select_best_candidate(
             distortion,
             candidate["bytes"],
         ) < (
-            best["lpips"],
+            score(best),
             best["bytes"],
         ):
             best = {
@@ -357,9 +444,9 @@ def optimize_jpeg(
     template_path: str | Path,
     output_dir: str | Path,
     reference: ImageReference,
-    metric: torch.nn.Module,
+    metric: torch.nn.Module | dict[str, torch.nn.Module],
     lambda_rd: float,
-    distortion_scale: float | None = None,
+    distortion_scale: float | dict[str, float] | None = None,
     steps: int = 1000,
     lr: float = 0.001,
     snapshot_every: int = 50,
@@ -369,28 +456,33 @@ def optimize_jpeg(
 ) -> tuple[list[dict], list[dict]]:
     """Optimize JPEG coefficients and quantization tables using Adam.
 
-    Minimizes normalized LPIPS distortion plus a weighted rate proxy.
+    Minimizes a rate-distortion objective using LPIPS and a differentiable
+    rate proxy. With multiple LPIPS networks, distortion is the maximum
+    of their independently normalized scores.
 
-    Args:
-        initial_state: Component dictionaries containing quantized DCT
-            coefficients and quantization tables.
-        template_path: JPEG used as the bitstream template.
-        output_dir: Directory for snapshot JPEGs.
-        reference: Cached source image representations.
-        metric: Frozen differentiable perceptual metric.
-        lambda_rd: Weight applied to normalized rate.
-        steps: Number of Adam optimization steps.
-        lr: Adam learning rate.
-        snapshot_every: Interval for exporting and evaluating JPEGs.
-        seed: Random seed used for parameter dithering.
-        max_grad_norm: Optional gradient clipping threshold.
-        verbose: Print optimization progress.
-        distortion_scale: Optional positive normalization constant for LPIPS.
-            Defaults to max(initial LPIPS, DISTORTION_FLOOR). An explicitly
-            provided value is not clamped.
+        Args:
+            initial_state: Component dictionaries containing quantized DCT
+                coefficients and quantization tables.
+            template_path: JPEG used as the bitstream template.
+            output_dir: Directory for snapshot JPEGs.
+            reference: Cached source image representations.
+            metric: Single LPIPS model or dictionary containing Alex and VGG
+                models. Networks are frozen automatically.
+            lambda_rd: Weight applied to normalized rate.
+            steps: Number of Adam optimization steps.
+            lr: Adam learning rate.
+            snapshot_every: Interval for exporting and evaluating JPEGs.
+            seed: Random seed used for parameter dithering.
+            max_grad_norm: Optional gradient clipping threshold.
+            verbose: Print optimization progress.
+            distortion_scale: Optional normalization scale for LPIPS.
+                Use a positive scalar for single-network optimization or a
+                dictionary with separate Alex and VGG scales for joint mode.
+                Defaults to the initial distortion, floored at DISTORTION_FLOOR.
+                Explicitly provided scales are not clamped.
 
-    Returns:
-        Tuple containing the final trainable state and snapshot history.
+        Returns:
+            Tuple containing the final trainable state and snapshot history.
     """
     if steps < 0:
         raise ValueError("steps must be nonnegative.")
@@ -408,11 +500,7 @@ def optimize_jpeg(
         if not math.isfinite(max_grad_norm) or max_grad_norm <= 0:
             raise ValueError("max_grad_norm must be positive and finite.")
 
-    if distortion_scale is not None:
-        distortion_scale = float(distortion_scale)
-
-        if not math.isfinite(distortion_scale) or distortion_scale <= 0:
-            raise ValueError("distortion_scale must be positive and finite.")
+    prepare_metrics(metric)
 
     template_path = Path(template_path)
     output_dir = Path(output_dir)
@@ -447,52 +535,81 @@ def optimize_jpeg(
 
     optimizer = torch.optim.Adam(parameters, lr=lr)
 
-    # Freeze LPIPS model parameters while preserving input gradients.
-    metric.eval()
-
-    for parameter in metric.parameters():
-        parameter.requires_grad_(False)
-
     height = reference.height
     width = reference.width
 
     # Measure objectives at the initialized state.
     with torch.no_grad():
-        initial_rgb = decode_jpeg_state(
-            state,
-            height,
-            width,
-        )
+        initial_rgb = decode_jpeg_state(state, height, width)
+        initial_lpips = tensor_rgb_to_lpips(initial_rgb)
 
-        initial_distortion = (
-            metric(
-                reference.lpips,
-                tensor_rgb_to_lpips(initial_rgb),
-            )
-            .mean()
-            .detach()
-        )
+        if isinstance(metric, dict):
+            initial_distortion = {
+                name: model(reference.lpips, initial_lpips).mean().detach()
+                for name, model in metric.items()
+            }
+        else:
+            initial_distortion = metric(reference.lpips, initial_lpips).mean().detach()
 
         initial_rate = jpeg_rate_proxy(state).detach()
 
-    if not bool(torch.isfinite(initial_distortion)):
-        raise ValueError("Initial distortion is not finite.")
+    distortions = (
+        initial_distortion.values()
+        if isinstance(initial_distortion, dict)
+        else (initial_distortion,)
+    )
+
+    for distortion in distortions:
+        if not bool(torch.isfinite(distortion)):
+            raise ValueError("Initial distortion is not finite.")
+
+        if bool(distortion < 0):
+            raise ValueError("Initial distortion must be nonnegative.")
 
     if not bool(torch.isfinite(initial_rate)):
         raise ValueError("Initial rate is not finite.")
 
-    if bool(initial_distortion < 0):
-        raise ValueError("Initial distortion must be nonnegative.")
-
     if bool(initial_rate < 0):
         raise ValueError("Initial rate must be nonnegative.")
 
+    if isinstance(metric, dict):
+        if distortion_scale is not None:
+            if not isinstance(distortion_scale, dict):
+                raise ValueError(
+                    "Joint optimization requires separate distortion scales."
+                )
+
+            if set(distortion_scale) != {"alex", "vgg"}:
+                raise ValueError("Distortion scales must contain 'alex' and 'vgg'.")
+
+            for name, value in distortion_scale.items():
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(
+                        f"{name} distortion scale must be positive and finite."
+                    )
+
+    elif distortion_scale is not None:
+        if isinstance(distortion_scale, dict):
+            raise ValueError(
+                "Single-metric optimization requires a scalar distortion scale."
+            )
+
+        distortion_scale = float(distortion_scale)
+
+        if not math.isfinite(distortion_scale) or distortion_scale <= 0:
+            raise ValueError("distortion_scale must be positive and finite.")
+
     if distortion_scale is None:
-        # Prevent near-zero LPIPS from exploding the normalized loss.
-        distortion_scale = max(
-            initial_distortion.item(),
-            DISTORTION_FLOOR,
-        )
+        if isinstance(initial_distortion, dict):
+            distortion_scale = {
+                name: max(value.item(), DISTORTION_FLOOR)
+                for name, value in initial_distortion.items()
+            }
+        else:
+            distortion_scale = max(
+                initial_distortion.item(),
+                DISTORTION_FLOOR,
+            )
 
     rate_scale = initial_rate.clamp_min(RATE_FLOOR)
 
@@ -517,25 +634,44 @@ def optimize_jpeg(
 
         print(f"Steps: {steps} | LR: {lr:g} | Lambda: {lambda_rd:g} | Seed: {seed}")
 
-        print(
-            f"Distortion scale: {distortion_scale:.6g} | "
-            f"Rate scale: {rate_scale.item():.6g}"
-        )
+        if isinstance(distortion_scale, dict):
+            scale_text = " | ".join(
+                f"{name}: {value:.6g}" for name, value in distortion_scale.items()
+            )
+        else:
+            scale_text = f"{distortion_scale:.6g}"
+
+        print(f"Distortion scale: {scale_text} | Rate scale: {rate_scale.item():.6g}")
 
         print()
 
-        print(
-            f"{'Step':>6} "
-            f"{'Loss':>9} "
-            f"{'D/scale':>9} "
-            f"{'R/scale':>9} "
-            f"{'bpp':>9} "
-            f"{'PSNR':>9} "
-            f"{'LPIPS':>12} "
-            f"{'Time':>9}"
-        )
-
-        print("-" * 83)
+        if isinstance(metric, dict):
+            print(
+                f"{'Step':>6} "
+                f"{'Loss':>9} "
+                f"{'D/max':>9} "
+                f"{'D/Alex':>9} "
+                f"{'D/VGG':>9} "
+                f"{'R/scale':>9} "
+                f"{'bpp':>9} "
+                f"{'PSNR':>9} "
+                f"{'Alex':>12} "
+                f"{'VGG':>12} "
+                f"{'Time':>9}"
+            )
+            print("-" * 115)
+        else:
+            print(
+                f"{'Step':>6} "
+                f"{'Loss':>9} "
+                f"{'D/scale':>9} "
+                f"{'R/scale':>9} "
+                f"{'bpp':>9} "
+                f"{'PSNR':>9} "
+                f"{'LPIPS':>12} "
+                f"{'Time':>9}"
+            )
+            print("-" * 83)
 
     for step in range(steps + 1):
         if step > 0:
@@ -586,7 +722,7 @@ def optimize_jpeg(
 
         # Recompute objectives after the optimizer update.
         with torch.no_grad():
-            d_norm, r_norm = compute_objectives(
+            d_norm, r_norm, details = compute_objectives(
                 state,
                 reference,
                 metric,
@@ -594,11 +730,11 @@ def optimize_jpeg(
                 rate_scale,
                 height,
                 width,
+                return_details=True,
             )
 
             loss = d_norm + lambda_rd * r_norm
-
-            rate = jpeg_rate_proxy(state)
+            rate = r_norm * rate_scale
 
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError(f"Non-finite snapshot loss at step {step}.")
@@ -633,6 +769,11 @@ def optimize_jpeg(
             "elapsed_seconds": elapsed,
         }
 
+        if isinstance(metric, dict):
+            row["lpips_vgg"] = actual["lpips_vgg"]
+            row["alex_norm"] = float(details["alex_norm"].item())
+            row["vgg_norm"] = float(details["vgg_norm"].item())
+
         for component in state:
             qcoeff, qtable = quantize_component(
                 component["coeff"],
@@ -652,19 +793,34 @@ def optimize_jpeg(
         history.append(row)
 
         if verbose:
-            print(
-                f"{step:6d} "
-                f"{row['loss']:9.4f} "
-                f"{row['distortion_norm']:9.4f} "
-                f"{row['rate_norm']:9.4f} "
-                f"{row['bpp']:9.4f} "
-                f"{row['psnr']:9.2f} "
-                f"{row['lpips']:12.6f} "
-                f"{elapsed:8.1f}s"
-            )
+            if isinstance(metric, dict):
+                print(
+                    f"{step:6d} "
+                    f"{row['loss']:9.4f} "
+                    f"{row['distortion_norm']:9.4f} "
+                    f"{row['alex_norm']:9.4f} "
+                    f"{row['vgg_norm']:9.4f} "
+                    f"{row['rate_norm']:9.4f} "
+                    f"{row['bpp']:9.4f} "
+                    f"{row['psnr']:9.2f} "
+                    f"{row['lpips']:12.6f} "
+                    f"{row['lpips_vgg']:12.6f} "
+                    f"{elapsed:8.1f}s"
+                )
+            else:
+                print(
+                    f"{step:6d} "
+                    f"{row['loss']:9.4f} "
+                    f"{row['distortion_norm']:9.4f} "
+                    f"{row['rate_norm']:9.4f} "
+                    f"{row['bpp']:9.4f} "
+                    f"{row['psnr']:9.2f} "
+                    f"{row['lpips']:12.6f} "
+                    f"{elapsed:8.1f}s"
+                )
 
     if verbose:
-        print("-" * 83)
+        print("-" * (115 if isinstance(metric, dict) else 83))
 
         print(
             f"Completed {steps} steps | "

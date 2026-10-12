@@ -123,7 +123,16 @@ def rgb_psnr(
 
 @dataclass(eq=False)
 class ImageReference:
-    """Reference image with cached representations for evaluation."""
+    """Cache an original RGB image and its normalized LPIPS input.
+
+    Attributes:
+        rgb: HxWx3 float32 array with values in [0, 255].
+        lpips: NCHW float32 tensor normalized to [-1, 1] on the
+            requested compute device.
+
+    The LPIPS input tensor is cached, but backbone feature maps
+    are not. Feature caching is planned as a separate optimization.
+    """
 
     rgb: np.ndarray
     lpips: torch.Tensor
@@ -134,7 +143,7 @@ class ImageReference:
         path: str | Path,
         device: torch.device | str,
     ) -> "ImageReference":
-        """Load and prepare a reference image."""
+        """Load an image and prepare its RGB and LPIPS representations."""
         rgb = load_rgb(path)
         lpips_tensor = rgb_to_lpips(rgb, device)
 
@@ -154,25 +163,34 @@ class ImageReference:
 def measure_jpeg(
     path: str | Path,
     reference: ImageReference,
-    metric: lpips.LPIPS,
+    metric: torch.nn.Module | dict[str, torch.nn.Module],
 ) -> dict:
-    """Measure the actual rate and distortion of an encoded JPEG.
+    """Measure actual JPEG bitrate and perceptual distortion.
 
-    The JPEG is decoded using Pillow rather than the differentiable
-    decoder. The LPIPS metric must reside on the same device as
-    reference.lpips.
+    Decode the JPEG with Pillow and evaluate PSNR and LPIPS against
+    the original reference image.
+
+    A single LPIPS model stores its score in the historical ``lpips``
+    field, regardless of the selected backbone. Joint evaluation
+    stores Alex in ``lpips`` and VGG in ``lpips_vgg``.
 
     Args:
         path: Path to the encoded JPEG.
         reference: Prepared reference image.
-        metric: Initialized LPIPS metric.
+        metric: Single LPIPS model or dictionary containing
+            ``alex`` and ``vgg`` models.
 
     Returns:
-        Dictionary containing path, bytes, bpp, PSNR, and LPIPS.
+        Dictionary containing the JPEG path, size in bytes, bitrate
+        in bits per pixel, RGB PSNR, and LPIPS measurements.
 
     Raises:
-        ValueError: If JPEG dimensions differ from the reference.
+        ValueError: If the JPEG dimensions differ from the reference.
     """
+
+    if isinstance(metric, dict) and set(metric) != {"alex", "vgg"}:
+        raise ValueError("Joint evaluation requires 'alex' and 'vgg' metrics.")
+
     path = Path(path)
 
     decoded_rgb = load_rgb(path)
@@ -189,22 +207,28 @@ def measure_jpeg(
     )
 
     with torch.inference_mode():
-        lpips_value = (
-            metric(
-                reference.lpips,
-                decoded_lpips,
-            )
-            .mean()
-            .item()
-        )
+        if isinstance(metric, dict):
+            lpips_values = {
+                name: model(reference.lpips, decoded_lpips).mean().item()
+                for name, model in metric.items()
+            }
+        else:
+            lpips_values = {
+                "alex": metric(reference.lpips, decoded_lpips).mean().item()
+            }
 
     size_bytes = path.stat().st_size
     n_pixels = reference.width * reference.height
 
-    return {
+    result = {
         "path": path,
         "bytes": size_bytes,
         "bpp": 8.0 * size_bytes / n_pixels,
         "psnr": rgb_psnr(reference.rgb, decoded_rgb),
-        "lpips": lpips_value,
+        "lpips": lpips_values["alex"],
     }
+
+    if "vgg" in lpips_values:
+        result["lpips_vgg"] = lpips_values["vgg"]
+
+    return result

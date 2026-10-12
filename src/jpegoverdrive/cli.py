@@ -114,7 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         metavar="VALUE",
-        help=("LPIPS normalization scale. Default: max(initial LPIPS, 1e-3)."),
+        help=(
+            "LPIPS normalization scale for single-network optimization. "
+            "Joint optimization uses independent automatic scales."
+        ),
     )
 
     optimize_parser.add_argument(
@@ -140,9 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     optimize_parser.add_argument(
         "--net",
+        nargs="+",
         choices=["alex", "vgg"],
-        default="alex",
-        help="LPIPS backbone (default: alex).",
+        default=["alex", "vgg"],
+        help="LPIPS backbones (default: alex vgg; multiple use max).",
     )
 
     return parser
@@ -300,7 +304,11 @@ def save_history(
     history: list[dict],
     path: Path,
 ) -> None:
-    """Save optimization snapshot measurements as CSV."""
+    """Export optimization snapshots to CSV.
+
+    Preserve all recorded measurements, including individual LPIPS
+    scores and normalized distortions when joint optimization is enabled.
+    """
     if not history:
         raise ValueError("Optimization history is empty.")
 
@@ -365,7 +373,11 @@ def print_optimization_summary(
     best: dict,
     output: Path,
 ) -> None:
-    """Print the actual rate-distortion comparison."""
+    """Report file size, PSNR, and perceptual quality improvements.
+
+    Display separate Alex and VGG measurements for joint optimization,
+    or a single LPIPS measurement for single-network optimization.
+    """
     rate_savings = 100.0 * (1.0 - best["bytes"] / baseline["bytes"])
 
     if baseline["lpips"] > 0:
@@ -400,12 +412,29 @@ def print_optimization_summary(
 
     print(f"{'PSNR (dB)':<19}{baseline['psnr']:>17.3f}{best['psnr']:>17.3f}")
 
-    print(f"{'LPIPS':<19}{baseline['lpips']:>17.8f}{best['lpips']:>17.8f}")
+    if "lpips_vgg" in baseline:
+        print(f"{'LPIPS Alex':<19}{baseline['lpips']:>17.8f}{best['lpips']:>17.8f}")
+        print(
+            f"{'LPIPS VGG':<19}{baseline['lpips_vgg']:>17.8f}{best['lpips_vgg']:>17.8f}"
+        )
+    else:
+        print(f"{'LPIPS':<19}{baseline['lpips']:>17.8f}{best['lpips']:>17.8f}")
 
     print("-" * 53)
 
     print(f"Rate savings:       {rate_savings:+.2f}%")
-    print(f"LPIPS improvement:  {lpips_change}")
+    if "lpips_vgg" in baseline:
+        if baseline["lpips_vgg"] > 0:
+            vgg_improvement = 100.0 * (1.0 - best["lpips_vgg"] / baseline["lpips_vgg"])
+            vgg_change = f"{vgg_improvement:+.2f}%"
+        else:
+            vgg_change = "N/A (zero baseline)"
+
+        print(f"LPIPS Alex change:  {lpips_change}")
+        print(f"LPIPS VGG change:   {vgg_change}")
+    else:
+        print(f"LPIPS improvement:  {lpips_change}")
+
     print(f"PSNR improvement:   {psnr_change}")
 
     print()
@@ -414,7 +443,14 @@ def print_optimization_summary(
 
 
 def run_optimize(args: argparse.Namespace) -> None:
-    """Optimize a JPEG and export the best measured candidate."""
+    """Run JPEG optimization and export the best eligible candidate.
+
+    Single-network optimization minimizes LPIPS. With Alex and VGG,
+    the optimizer minimizes the maximum independently normalized LPIPS.
+
+    Candidates are evaluated using actual JPEG measurements and selected
+    subject to the baseline file-size constraint.
+    """
     import jpegio as jio
 
     from jpegoverdrive.metrics import (
@@ -431,16 +467,31 @@ def run_optimize(args: argparse.Namespace) -> None:
     if args.output.resolve() == args.baseline.resolve():
         raise ValueError("Output must be different from the baseline JPEG.")
 
+    if len(args.net) not in (1, 2) or (
+        len(args.net) == 2 and set(args.net) != {"alex", "vgg"}
+    ):
+        raise ValueError("Specify one LPIPS network or both Alex and VGG.")
+
+    if len(args.net) > 1 and args.distortion_scale is not None:
+        raise ValueError(
+            "--distortion-scale requires a single network (--net alex or --net vgg). "
+            "Joint optimization uses independent automatic normalization."
+        )
+
     device = get_device(args.device)
+    if len(args.net) == 1:
+        metric = create_lpips_metric(
+            device=device,
+            net=args.net[0],
+        )
+    else:
+        metric = {
+            name: create_lpips_metric(device=device, net=name) for name in args.net
+        }
 
     reference = ImageReference.from_file(
         args.source,
         device=device,
-    )
-
-    metric = create_lpips_metric(
-        device=device,
-        net=args.net,
     )
 
     jpeg = jio.read(str(args.baseline))
@@ -484,6 +535,7 @@ def run_optimize(args: argparse.Namespace) -> None:
     best = select_best_candidate(
         history,
         baseline,
+        nets=tuple(args.net),
     )
 
     selected_path = args.baseline if best["is_baseline"] else best["path"]
@@ -518,6 +570,13 @@ def run_optimize(args: argparse.Namespace) -> None:
     else:
         psnr_improvement = None
 
+    if "lpips_vgg" in baseline and baseline["lpips_vgg"] > 0:
+        lpips_vgg_improvement = 100.0 * (
+            1.0 - best["lpips_vgg"] / baseline["lpips_vgg"]
+        )
+    else:
+        lpips_vgg_improvement = None
+
     summary = {
         "version": __version__,
         "source": args.source,
@@ -533,12 +592,17 @@ def run_optimize(args: argparse.Namespace) -> None:
             "device": str(device),
             "net": args.net,
         },
-        "selection": "best_lpips_at_or_below_baseline_size",
+        "selection": (
+            "best_max_normalized_lpips_at_or_below_baseline_size"
+            if len(args.net) > 1
+            else "best_lpips_at_or_below_baseline_size"
+        ),
         "baseline": baseline,
         "initialization": initialization,
         "selected": best,
         "rate_savings_percent": rate_savings,
         "lpips_improvement_percent": lpips_improvement,
+        "lpips_vgg_improvement_percent": lpips_vgg_improvement,
         "psnr_improvement_db": psnr_improvement,
     }
 

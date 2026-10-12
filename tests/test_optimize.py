@@ -15,6 +15,7 @@
 """Tests for gradient-based JPEG optimization."""
 
 import math
+from unittest.mock import patch
 
 import jpegio as jio
 import numpy as np
@@ -33,11 +34,38 @@ from jpegoverdrive.optimize import (
     make_trainable_state,
     make_trainable_state_from_state,
     optimize_jpeg,
+    prepare_metrics,
     rate_proxy,
     select_best_candidate,
     tensor_rgb_to_lpips,
     trainable_parameters,
 )
+
+
+class ConstantMetric(torch.nn.Module):
+    """Return a fixed distortion value for testing."""
+
+    def __init__(self, value: float):
+        """Initialize the constant distortion value."""
+        super().__init__()
+        self.value = value
+
+    def forward(self, reference, decoded):
+        """Return the configured distortion without affecting gradients."""
+        return decoded.sum() * 0 + self.value
+
+
+class ScaledMetric(torch.nn.Module):
+    """Produce a differentiable distortion proportional to the input."""
+
+    def __init__(self, scale: float):
+        """Initialize the distortion scale factor."""
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, reference, decoded):
+        """Return the scaled mean of the reconstructed image."""
+        return decoded.mean() * self.scale
 
 
 class MockLPIPS(torch.nn.Module):
@@ -156,6 +184,51 @@ def test_extract_jpeg_state(jpeg_template):
         )
 
     print("\nJPEG state extraction: coefficients and tables preserved")
+
+
+@pytest.fixture
+def mock_metrics():
+    """Return trainable Alex and VGG stand-in modules."""
+    return {
+        "alex": torch.nn.Linear(1, 1),
+        "vgg": torch.nn.Linear(1, 1),
+    }
+
+
+def test_prepare_single_metric(mock_metrics):
+    """Verify that a single metric is frozen and set to evaluation mode."""
+    metric = mock_metrics["alex"]
+
+    prepare_metrics(metric)
+
+    assert not metric.training
+    assert all(not p.requires_grad for p in metric.parameters())
+
+
+def test_prepare_joint_metrics(mock_metrics):
+    """Verify that both joint metrics are frozen and set to evaluation mode."""
+    prepare_metrics(mock_metrics)
+
+    for model in mock_metrics.values():
+        assert not model.training
+        assert all(not p.requires_grad for p in model.parameters())
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("alex",),
+        ("vgg",),
+        ("alex", "other"),
+        (),
+    ],
+)
+def test_prepare_invalid_joint_metrics(names):
+    """Reject metric dictionaries without exactly Alex and VGG."""
+    metrics = {name: torch.nn.Linear(1, 1) for name in names}
+
+    with pytest.raises(ValueError, match="requires 'alex' and 'vgg'"):
+        prepare_metrics(metrics)
 
 
 def test_trainable_state_reproducible(jpeg_template):
@@ -784,6 +857,270 @@ def test_optimize_explicit_distortion_scale(
 
 
 @pytest.mark.parametrize(
+    ("alex", "vgg", "expected"),
+    [
+        (0.20, 0.30, 2.0),  # Alex: 2.0, VGG: 1.5
+        (0.15, 0.50, 2.5),  # Alex: 1.5, VGG: 2.5
+    ],
+)
+def test_joint_distortion(alex, vgg, expected):
+    """Use the maximum independently normalized distortion."""
+    metrics = {
+        "alex": ConstantMetric(alex),
+        "vgg": ConstantMetric(vgg),
+    }
+
+    with (
+        patch(
+            "jpegoverdrive.optimize.decode_jpeg_state",
+            return_value=torch.zeros(8, 8, 3),
+        ),
+        patch(
+            "jpegoverdrive.optimize.jpeg_rate_proxy",
+            return_value=torch.tensor(50.0),
+        ),
+    ):
+        distortion, rate = compute_objectives(
+            state=[],
+            reference=type("Reference", (), {"lpips": torch.zeros(1, 3, 8, 8)})(),
+            metric=metrics,
+            initial_distortion={"alex": 0.10, "vgg": 0.20},
+            initial_rate=torch.tensor(100.0),
+            height=8,
+            width=8,
+        )
+
+    assert distortion.item() == pytest.approx(expected)
+    assert rate.item() == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    ("alex_scale", "vgg_scale", "expected_gradient"),
+    [
+        (2.0, 1.0, 2.0),
+        (1.0, 3.0, 3.0),
+    ],
+)
+def test_joint_distortion_gradient(
+    alex_scale,
+    vgg_scale,
+    expected_gradient,
+):
+    """Backpropagate through the metric with the larger normalized distortion."""
+    pixel = torch.tensor(255.0, requires_grad=True)
+
+    metrics = {
+        "alex": ScaledMetric(alex_scale),
+        "vgg": ScaledMetric(vgg_scale),
+    }
+
+    # Use the same pixel value throughout the mock decoded image.
+    decoded = pixel.expand(8, 8, 3)
+
+    with (
+        patch(
+            "jpegoverdrive.optimize.decode_jpeg_state",
+            return_value=decoded,
+        ),
+        patch(
+            "jpegoverdrive.optimize.jpeg_rate_proxy",
+            return_value=torch.tensor(0.0),
+        ),
+    ):
+        distortion, _ = compute_objectives(
+            state=[],
+            reference=type("Reference", (), {"lpips": torch.zeros(1, 3, 8, 8)})(),
+            metric=metrics,
+            initial_distortion={"alex": 1.0, "vgg": 1.0},
+            initial_rate=torch.tensor(1.0),
+            height=8,
+            width=8,
+        )
+
+    distortion.backward()
+
+    # tensor_rgb_to_lpips maps [0,255] to [-1,1], so its
+    # derivative introduces a factor of 2/255.
+    assert pixel.grad.item() == pytest.approx(
+        expected_gradient * 2.0 / 255.0,
+        rel=1e-5,
+    )
+
+
+def test_single_metric_objective():
+    """Preserve the single-network distortion and rate objectives."""
+    metric = ConstantMetric(0.25)
+
+    with (
+        patch(
+            "jpegoverdrive.optimize.decode_jpeg_state",
+            return_value=torch.zeros(8, 8, 3),
+        ),
+        patch(
+            "jpegoverdrive.optimize.jpeg_rate_proxy",
+            return_value=torch.tensor(50.0),
+        ),
+    ):
+        distortion, rate = compute_objectives(
+            state=[],
+            reference=type("Reference", (), {"lpips": torch.zeros(1, 3, 8, 8)})(),
+            metric=metric,
+            initial_distortion=torch.tensor(0.10),
+            initial_rate=torch.tensor(100.0),
+            height=8,
+            width=8,
+        )
+
+    assert distortion.item() == pytest.approx(2.5)
+    assert rate.item() == pytest.approx(0.5)
+
+
+def test_joint_optimization_default_scales(
+    jpeg_template,
+    initial_state,
+    reference,
+    tmp_path,
+):
+    """Normalize Alex and VGG independently using their initial scores."""
+    metrics = {
+        "alex": MockLPIPS(),
+        "vgg": MockLPIPS(),
+    }
+
+    with patch(
+        "jpegoverdrive.optimize.measure_jpeg",
+        return_value={
+            "bytes": 1000,
+            "bpp": 1.0,
+            "psnr": 30.0,
+            "lpips": 0.01,
+            "lpips_vgg": 0.02,
+        },
+    ):
+        _, history = optimize_jpeg(
+            initial_state=initial_state,
+            template_path=jpeg_template,
+            output_dir=tmp_path / "joint",
+            reference=reference,
+            metric=metrics,
+            lambda_rd=0.01,
+            steps=0,
+            verbose=False,
+        )
+
+    assert len(history) == 1
+    row = history[0]
+    assert row["distortion_norm"] == pytest.approx(1.0)
+
+    assert row["lpips"] == pytest.approx(0.01)
+    assert row["lpips_vgg"] == pytest.approx(0.02)
+
+    assert "alex_norm" in row
+    assert "vgg_norm" in row
+    assert row["alex_norm"] == pytest.approx(1.0)
+    assert row["vgg_norm"] == pytest.approx(1.0)
+
+    assert row["distortion_norm"] == pytest.approx(
+        max(row["alex_norm"], row["vgg_norm"])
+    )
+
+
+def test_joint_optimization_explicit_scales(
+    jpeg_template,
+    initial_state,
+    reference,
+    tmp_path,
+):
+    """Apply independent user-provided Alex and VGG normalization scales."""
+    metrics = {
+        "alex": MockLPIPS(),
+        "vgg": MockLPIPS(),
+    }
+
+    scales = {
+        "alex": 0.5,
+        "vgg": 0.25,
+    }
+
+    with patch(
+        "jpegoverdrive.optimize.measure_jpeg",
+        return_value={
+            "bytes": 1000,
+            "bpp": 1.0,
+            "psnr": 30.0,
+            "lpips": 0.01,
+            "lpips_vgg": 0.02,
+        },
+    ):
+        _, history = optimize_jpeg(
+            initial_state=initial_state,
+            template_path=jpeg_template,
+            output_dir=tmp_path / "joint_explicit",
+            reference=reference,
+            metric=metrics,
+            lambda_rd=0.01,
+            distortion_scale=scales,
+            steps=0,
+            verbose=False,
+        )
+
+    assert len(history) == 1
+    row = history[0]
+    assert math.isfinite(row["distortion_norm"])
+    assert row["lpips"] == pytest.approx(0.01)
+    assert row["lpips_vgg"] == pytest.approx(0.02)
+
+    assert "alex_norm" in row
+    assert "vgg_norm" in row
+    assert row["vgg_norm"] == pytest.approx(2.0 * row["alex_norm"])
+
+    assert row["distortion_norm"] == pytest.approx(
+        max(row["alex_norm"], row["vgg_norm"])
+    )
+
+
+def test_joint_objective_details():
+    """Return individual normalized metric scores when requested."""
+    metrics = {
+        "alex": ConstantMetric(0.20),
+        "vgg": ConstantMetric(0.30),
+    }
+
+    with (
+        patch(
+            "jpegoverdrive.optimize.decode_jpeg_state",
+            return_value=torch.zeros(8, 8, 3),
+        ),
+        patch(
+            "jpegoverdrive.optimize.jpeg_rate_proxy",
+            return_value=torch.tensor(50.0),
+        ),
+    ):
+        distortion, rate, details = compute_objectives(
+            state=[],
+            reference=type(
+                "Reference",
+                (),
+                {"lpips": torch.zeros(1, 3, 8, 8)},
+            )(),
+            metric=metrics,
+            initial_distortion={
+                "alex": 0.10,
+                "vgg": 0.20,
+            },
+            initial_rate=torch.tensor(100.0),
+            height=8,
+            width=8,
+            return_details=True,
+        )
+
+    assert details["alex_norm"].item() == pytest.approx(2.0)
+    assert details["vgg_norm"].item() == pytest.approx(1.5)
+    assert distortion.item() == pytest.approx(2.0)
+    assert rate.item() == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
     "scale",
     [0.0, -1.0, math.nan, math.inf, -math.inf],
 )
@@ -794,6 +1131,7 @@ def test_invalid_distortion_scale(
     reference,
     tmp_path,
 ):
+    """Reject nonpositive and nonfinite distortion scales."""
     with pytest.raises(ValueError, match="distortion_scale"):
         optimize_jpeg(
             initial_state=initial_state,
@@ -897,4 +1235,144 @@ def test_optimize_rejects_mismatched_qtable(
             lambda_rd=0.01,
             steps=0,
             verbose=False,
+        )
+
+
+def test_joint_optimization_console(
+    jpeg_template,
+    initial_state,
+    reference,
+    tmp_path,
+    capsys,
+):
+    """Verify joint optimization displays both LPIPS metrics."""
+    metrics = {
+        "alex": MockLPIPS(),
+        "vgg": MockLPIPS(),
+    }
+
+    optimize_jpeg(
+        initial_state=initial_state,
+        template_path=jpeg_template,
+        output_dir=tmp_path / "joint_console",
+        reference=reference,
+        metric=metrics,
+        lambda_rd=0.01,
+        steps=0,
+        verbose=True,
+    )
+
+    output = capsys.readouterr().out
+
+    assert "D/max" in output
+    assert "D/Alex" in output
+    assert "D/VGG" in output
+    assert "Alex" in output
+    assert "VGG" in output
+    assert "Completed 0 steps" in output
+
+
+def test_select_best_candidate_joint():
+    """Select the lowest worst-case normalized LPIPS."""
+    baseline = {
+        "path": "baseline.jpg",
+        "bytes": 1000,
+        "lpips": 0.020,
+        "lpips_vgg": 0.040,
+    }
+
+    history = [
+        {
+            "step": 10,
+            "path": "candidate_a.jpg",
+            "bytes": 900,
+            "lpips": 0.015,
+            "lpips_vgg": 0.050,
+        },
+        {
+            "step": 20,
+            "path": "candidate_b.jpg",
+            "bytes": 950,
+            "lpips": 0.018,
+            "lpips_vgg": 0.036,
+        },
+    ]
+
+    best = select_best_candidate(
+        history,
+        baseline,
+        nets=("alex", "vgg"),
+    )
+
+    assert best["step"] == 20
+    assert best["is_baseline"] is False
+
+
+def test_select_best_candidate_joint_fallback():
+    """Retain the baseline when no candidate improves worst-case LPIPS."""
+    baseline = {
+        "path": "baseline.jpg",
+        "bytes": 1000,
+        "lpips": 0.020,
+        "lpips_vgg": 0.040,
+    }
+
+    history = [
+        {
+            "step": 10,
+            "path": "candidate_a.jpg",
+            "bytes": 900,
+            "lpips": 0.015,
+            "lpips_vgg": 0.050,
+        },
+        {
+            "step": 20,
+            "path": "candidate_b.jpg",
+            "bytes": 950,
+            "lpips": 0.025,
+            "lpips_vgg": 0.035,
+        },
+    ]
+
+    best = select_best_candidate(
+        history,
+        baseline,
+        nets=("alex", "vgg"),
+    )
+
+    assert best["is_baseline"] is True
+    assert best["step"] is None
+
+
+def test_joint_selection_requires_baseline_vgg():
+    """Reject joint selection when the baseline lacks VGG measurements."""
+    baseline = {"bytes": 1000, "lpips": 0.1}
+    history = [{"bytes": 900, "lpips": 0.09, "lpips_vgg": 0.12}]
+
+    with pytest.raises(ValueError, match="baseline"):
+        select_best_candidate(
+            history,
+            baseline,
+            nets=("alex", "vgg"),
+        )
+
+
+def test_joint_selection_requires_candidate_vgg():
+    """Identify candidates missing required VGG measurements."""
+    baseline = {
+        "bytes": 1000,
+        "lpips": 0.1,
+        "lpips_vgg": 0.15,
+    }
+
+    history = [
+        {"bytes": 900, "lpips": 0.09, "lpips_vgg": 0.12},
+        {"bytes": 850, "lpips": 0.08},
+    ]
+
+    with pytest.raises(ValueError, match="candidate 1"):
+        select_best_candidate(
+            history,
+            baseline,
+            nets=("alex", "vgg"),
         )
