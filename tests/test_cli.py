@@ -17,6 +17,7 @@
 import argparse
 import csv
 import json
+import shutil
 from pathlib import Path
 
 import jpegio as jio
@@ -84,6 +85,15 @@ def test_version(capsys):
     assert __version__ in capsys.readouterr().out
 
 
+def test_invalid_argument(capsys):
+    """Verify invalid CLI arguments produce a usage error."""
+    with pytest.raises(SystemExit) as exc:
+        main(["--invalid"])
+
+    assert exc.value.code == 2
+    assert "error:" in capsys.readouterr().err
+
+
 def test_optimize_help(capsys):
     """Verify optimize subcommand help."""
     with pytest.raises(SystemExit) as exc:
@@ -125,6 +135,33 @@ def test_optimize_arguments():
     assert args.steps == 100
     assert args.lr == pytest.approx(0.002)
     assert args.lambda_rd == pytest.approx(0.01)
+    assert args.net == ["alex", "vgg"]
+
+
+@pytest.mark.parametrize(
+    ("nets", "expected"),
+    [
+        (["alex"], ["alex"]),
+        (["vgg"], ["vgg"]),
+        (["alex", "vgg"], ["alex", "vgg"]),
+        (["vgg", "alex"], ["vgg", "alex"]),
+    ],
+)
+def test_optimize_net_choices(nets, expected):
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "optimize",
+            "source.png",
+            "baseline.jpg",
+            "output.jpg",
+            "--net",
+            *nets,
+        ]
+    )
+
+    assert args.net == expected
 
 
 def test_compare_jpeg_states_identical(jpeg_template):
@@ -412,7 +449,7 @@ def test_run_optimize_baseline_fallback(
         snapshot_every=1,
         seed=0,
         device="cpu",
-        net="alex",
+        net=["alex"],
     )
 
     class MockMetric(torch.nn.Module):
@@ -450,7 +487,6 @@ def test_run_optimize_baseline_fallback(
 
         snapshot = output_dir / "step_000000.jpg"
 
-        shutil = __import__("shutil")
         shutil.copyfile(template_path, snapshot)
 
         actual = metrics.measure_jpeg(
@@ -511,7 +547,6 @@ def test_run_optimize_selects_snapshot(
 ):
     """Verify the CLI selects and copies an improved JPEG snapshot."""
     import json
-    import shutil
 
     from jpegoverdrive import metrics, optimize
 
@@ -533,7 +568,7 @@ def test_run_optimize_selects_snapshot(
         snapshot_every=1,
         seed=0,
         device="cpu",
-        net="alex",
+        net=["alex"],
     )
 
     class MockMetric(torch.nn.Module):
@@ -605,3 +640,122 @@ def test_run_optimize_selects_snapshot(
 
     assert summary["selected"]["is_baseline"] is False
     assert summary["selected"]["step"] == 0
+
+
+def test_run_optimize_joint_metrics(
+    jpeg_template,
+    tmp_path,
+    monkeypatch,
+):
+    """Verify the CLI initializes both LPIPS networks."""
+    from jpegoverdrive import metrics, optimize
+
+    source = tmp_path / "source.png"
+
+    with Image.open(jpeg_template) as image:
+        image.save(source)
+
+    created = []
+
+    class MockMetric(torch.nn.Module):
+        def forward(self, reference, reconstructed):
+            return (
+                (reference - reconstructed)
+                .square()
+                .mean(
+                    dim=(1, 2, 3),
+                    keepdim=True,
+                )
+            )
+
+    def create_metric(device, net):
+        created.append(net)
+        return MockMetric()
+
+    monkeypatch.setattr(metrics, "create_lpips_metric", create_metric)
+
+    def fake_optimize_jpeg(
+        initial_state,
+        template_path,
+        output_dir,
+        reference,
+        metric,
+        lambda_rd,
+        **kwargs,
+    ):
+        assert set(metric) == {"alex", "vgg"}
+        assert kwargs["distortion_scale"] is None
+
+        # Stop after confirming that the correct metrics were passed.
+        raise RuntimeError("Metrics initialized")
+
+    monkeypatch.setattr(optimize, "optimize_jpeg", fake_optimize_jpeg)
+
+    args = build_parser().parse_args(
+        [
+            "optimize",
+            str(source),
+            str(jpeg_template),
+            str(tmp_path / "optimized.jpg"),
+            "--steps",
+            "0",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="Metrics initialized"):
+        run_optimize(args)
+
+    assert created == ["alex", "vgg"]
+
+
+def test_print_joint_optimization_summary(capsys, tmp_path):
+    baseline = {
+        "bytes": 1000,
+        "bpp": 2.0,
+        "psnr": 35.0,
+        "lpips": 0.020,
+        "lpips_vgg": 0.040,
+    }
+
+    best = {
+        "step": 50,
+        "is_baseline": False,
+        "bytes": 900,
+        "bpp": 1.8,
+        "psnr": 35.5,
+        "lpips": 0.018,
+        "lpips_vgg": 0.036,
+    }
+
+    print_optimization_summary(
+        baseline,
+        best,
+        tmp_path / "optimized.jpg",
+    )
+
+    output = capsys.readouterr().out
+
+    assert "LPIPS Alex" in output
+    assert "LPIPS VGG" in output
+    assert "LPIPS Alex change:" in output
+    assert "LPIPS VGG change:" in output
+    assert "PSNR improvement:" in output
+    assert "+10.00%" in output
+
+
+def test_joint_distortion_scale_rejected(tmp_path):
+    args = build_parser().parse_args(
+        [
+            "optimize",
+            "source.png",
+            "baseline.jpg",
+            str(tmp_path / "output.jpg"),
+            "--distortion-scale",
+            "0.01",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="requires a single network"):
+        run_optimize(args)

@@ -45,6 +45,17 @@ class MockLPIPS(torch.nn.Module):
         )
 
 
+class ScaledMockLPIPS(MockLPIPS):
+    """Mock LPIPS with a configurable distortion scale."""
+
+    def __init__(self, scale: float):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, reference, reconstructed):
+        return super().forward(reference, reconstructed) * self.scale
+
+
 @pytest.fixture
 def source_image():
     """Create a deterministic RGB test image."""
@@ -289,3 +300,41 @@ def test_create_lpips_metric():
 
     assert result.numel() == 1
     assert torch.isfinite(result).all()
+
+
+def test_measure_jpeg_joint(tmp_path, jpeg_path, source_image):
+    """Verify joint evaluation reports both LPIPS metrics."""
+    source_path = tmp_path / "source.png"
+    Image.fromarray(source_image).save(source_path)
+
+    reference = ImageReference.from_file(source_path, device="cpu")
+
+    metrics = {
+        "alex": MockLPIPS(),
+        "vgg": ScaledMockLPIPS(2.0),
+    }
+    result = measure_jpeg(jpeg_path, reference, metrics)
+
+    assert "lpips" in result
+    assert "lpips_vgg" in result
+
+    assert result["lpips"] > 0
+    assert result["lpips_vgg"] == pytest.approx(2.0 * result["lpips"])
+
+
+def test_measure_jpeg_single(tmp_path, jpeg_path, source_image):
+    """Verify single-metric evaluation preserves the existing API."""
+    source_path = tmp_path / "source.png"
+    Image.fromarray(source_image).save(source_path)
+
+    reference = ImageReference.from_file(source_path, device="cpu")
+
+    result = measure_jpeg(
+        jpeg_path,
+        reference,
+        MockLPIPS(),
+    )
+
+    assert "lpips" in result
+    assert "lpips_vgg" not in result
+    assert result["lpips"] > 0
