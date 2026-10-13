@@ -21,7 +21,77 @@ from pathlib import Path
 import lpips
 import numpy as np
 import torch
+from lpips import normalize_tensor, spatial_average
 from PIL import Image
+
+
+class CachedLPIPS(torch.nn.Module):
+    """LPIPS with cached reference features."""
+
+    def __init__(
+        self,
+        metric: torch.nn.Module,
+        reference: torch.Tensor,
+    ):
+        super().__init__()
+
+        self.metric = metric.eval()
+        self.reference = reference
+
+        with torch.no_grad():
+            scaled = self.metric.scaling_layer(reference)
+
+            for i, feature in enumerate(self.metric.net(scaled)):
+                self.register_buffer(
+                    f"reference_feature_{i}",
+                    normalize_tensor(feature).detach(),
+                    persistent=False,
+                )
+
+    def forward(
+        self,
+        reference: torch.Tensor,
+        image: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate LPIPS using the cached reference features."""
+        if reference is not self.reference:
+            raise ValueError("CachedLPIPS received a different reference.")
+
+        scaled = self.metric.scaling_layer(image)
+        features = self.metric.net(scaled)
+
+        distances = []
+
+        for i, (feature, layer) in enumerate(zip(features, self.metric.lins)):
+            cached = getattr(self, f"reference_feature_{i}")
+
+            distances.append(
+                spatial_average(
+                    layer((cached - normalize_tensor(feature)) ** 2),
+                    keepdim=True,
+                )
+            )
+
+        return sum(distances)
+
+
+def maybe_cache_lpips(
+    metric: torch.nn.Module,
+    reference: torch.Tensor,
+    *,
+    enabled: bool = True,
+) -> torch.nn.Module:
+    """Cache supported LPIPS models without changing custom metric behavior."""
+    if (
+        enabled
+        and type(metric) is lpips.LPIPS
+        and metric.lpips
+        and metric.version == "0.1"
+        and not metric.spatial
+    ):
+        return CachedLPIPS(metric, reference)
+
+    return metric
 
 
 def create_lpips_metric(
@@ -125,13 +195,13 @@ def rgb_psnr(
 class ImageReference:
     """Cache an original RGB image and its normalized LPIPS input.
 
-    Attributes:
-        rgb: HxWx3 float32 array with values in [0, 255].
-        lpips: NCHW float32 tensor normalized to [-1, 1] on the
-            requested compute device.
+        Attributes:
+            rgb: HxWx3 float32 array with values in [0, 255].
+            lpips: NCHW float32 tensor normalized to [-1, 1] on the
+                requested compute device.
 
-    The LPIPS input tensor is cached, but backbone feature maps
-    are not. Feature caching is planned as a separate optimization.
+    The LPIPS input tensor is cached here. Backbone feature caching
+    is handled separately by CachedLPIPS during optimization.
     """
 
     rgb: np.ndarray

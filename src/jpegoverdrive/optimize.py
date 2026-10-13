@@ -23,7 +23,11 @@ import torch
 
 from jpegoverdrive.decoder import decode_component, ycbcr_to_rgb
 from jpegoverdrive.jpeg import quantize_component, write_jpeg_state
-from jpegoverdrive.metrics import ImageReference, measure_jpeg
+from jpegoverdrive.metrics import (
+    ImageReference,
+    maybe_cache_lpips,
+    measure_jpeg,
+)
 from jpegoverdrive.utils import array_to_blocks, ste_round
 
 DISTORTION_FLOOR = 1e-3
@@ -453,6 +457,7 @@ def optimize_jpeg(
     seed: int = 0,
     max_grad_norm: float | None = None,
     verbose: bool = True,
+    cache_lpips: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     """Optimize JPEG coefficients and quantization tables using Adam.
 
@@ -469,17 +474,19 @@ def optimize_jpeg(
             metric: Single LPIPS model or dictionary containing Alex and VGG
                 models. Networks are frozen automatically.
             lambda_rd: Weight applied to normalized rate.
+            distortion_scale: Optional normalization scale for LPIPS.
+                Use a positive scalar for single-network optimization or a
+                dictionary with separate Alex and VGG scales for joint mode.
+                Defaults to the initial distortion, floored at DISTORTION_FLOOR.
+                Explicitly provided scales are not clamped.
             steps: Number of Adam optimization steps.
             lr: Adam learning rate.
             snapshot_every: Interval for exporting and evaluating JPEGs.
             seed: Random seed used for parameter dithering.
             max_grad_norm: Optional gradient clipping threshold.
             verbose: Print optimization progress.
-            distortion_scale: Optional normalization scale for LPIPS.
-                Use a positive scalar for single-network optimization or a
-                dictionary with separate Alex and VGG scales for joint mode.
-                Defaults to the initial distortion, floored at DISTORTION_FLOOR.
-                Explicitly provided scales are not clamped.
+            cache_lpips: Cache LPIPS reference features to accelerate optimization.
+                Enabled by default.
 
         Returns:
             Tuple containing the final trainable state and snapshot history.
@@ -501,6 +508,18 @@ def optimize_jpeg(
             raise ValueError("max_grad_norm must be positive and finite.")
 
     prepare_metrics(metric)
+
+    if isinstance(metric, dict):
+        objective_metric = {
+            name: maybe_cache_lpips(model, reference.lpips, enabled=cache_lpips)
+            for name, model in metric.items()
+        }
+    else:
+        objective_metric = maybe_cache_lpips(
+            metric,
+            reference.lpips,
+            enabled=cache_lpips,
+        )
 
     template_path = Path(template_path)
     output_dir = Path(output_dir)
@@ -546,10 +565,12 @@ def optimize_jpeg(
         if isinstance(metric, dict):
             initial_distortion = {
                 name: model(reference.lpips, initial_lpips).mean().detach()
-                for name, model in metric.items()
+                for name, model in objective_metric.items()
             }
         else:
-            initial_distortion = metric(reference.lpips, initial_lpips).mean().detach()
+            initial_distortion = (
+                objective_metric(reference.lpips, initial_lpips).mean().detach()
+            )
 
         initial_rate = jpeg_rate_proxy(state).detach()
 
@@ -625,6 +646,7 @@ def optimize_jpeg(
         n_parameters = sum(parameter.numel() for parameter in parameters)
 
         print(f"JPEG Overdrive | Adam | {device.type.upper()}")
+        print(f"LPIPS feature caching: {'enabled' if cache_lpips else 'disabled'}")
 
         print(
             f"Image: {width}x{height} | "
@@ -680,13 +702,12 @@ def optimize_jpeg(
             d_norm, r_norm = compute_objectives(
                 state,
                 reference,
-                metric,
+                objective_metric,
                 distortion_scale,
                 rate_scale,
                 height,
                 width,
             )
-
             loss = d_norm + lambda_rd * r_norm
 
             if not bool(torch.isfinite(loss).detach()):
@@ -725,7 +746,7 @@ def optimize_jpeg(
             d_norm, r_norm, details = compute_objectives(
                 state,
                 reference,
-                metric,
+                objective_metric,
                 distortion_scale,
                 rate_scale,
                 height,

@@ -149,6 +149,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="LPIPS backbones (default: alex vgg; multiple use max).",
     )
 
+    optimize_parser.add_argument(
+        "--no-cache-lpips",
+        dest="cache_lpips",
+        action="store_false",
+        help="Disable LPIPS reference-feature caching.",
+    )
+
     return parser
 
 
@@ -521,6 +528,7 @@ def run_optimize(args: argparse.Namespace) -> None:
         lr=args.lr,
         snapshot_every=args.snapshot_every,
         seed=args.seed,
+        cache_lpips=getattr(args, "cache_lpips", True),
     )
 
     # Validate the actual step-0 bitstream against the baseline.
@@ -591,6 +599,7 @@ def run_optimize(args: argparse.Namespace) -> None:
             "seed": args.seed,
             "device": str(device),
             "net": args.net,
+            "cache_lpips": getattr(args, "cache_lpips", True),
         },
         "selection": (
             "best_max_normalized_lpips_at_or_below_baseline_size"
