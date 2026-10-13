@@ -23,11 +23,8 @@ import torch
 
 from jpegoverdrive.decoder import decode_component, ycbcr_to_rgb
 from jpegoverdrive.jpeg import quantize_component, write_jpeg_state
-from jpegoverdrive.metrics import (
-    ImageReference,
-    maybe_cache_lpips,
-    measure_jpeg,
-)
+from jpegoverdrive.metrics import ImageReference, maybe_cache_lpips, measure_jpeg
+from jpegoverdrive.scheduler import AdaptiveLPIPSScheduler
 from jpegoverdrive.utils import array_to_blocks, ste_round
 
 DISTORTION_FLOOR = 1e-3
@@ -317,61 +314,63 @@ def compute_objectives(
     width: int,
     *,
     return_details: bool = False,
+    active_metric: str = "both",
 ) -> (
     tuple[torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
 ):
-    """Compute differentiable normalized distortion and rate objectives.
+    """Compute normalized differentiable distortion and rate objectives.
 
-    For joint LPIPS optimization, distortion is the maximum of the
-    independently normalized Alex and VGG scores.
+    Full joint evaluation uses the maximum of independently normalized
+    Alex and VGG scores. Adaptive steps can use just one selected metric.
 
     Args:
         state: Trainable JPEG representation.
         reference: Cached source image representations.
-        metric: Single LPIPS network or an Alex/VGG metric dictionary.
-        initial_distortion: Normalization scales for perceptual distortion.
-        initial_rate: Normalization scale for the differentiable rate proxy.
+        metric: Single LPIPS network or Alex/VGG metric dictionary.
+        initial_distortion: LPIPS normalization scales.
+        initial_rate: Normalization scale for the rate proxy.
         height: Image height in pixels.
         width: Image width in pixels.
-        return_details: Include individual normalized LPIPS scores.
+        return_details: Return scores measured in this evaluation.
+        active_metric: "both", "alex", or "vgg" for joint metrics.
 
     Returns:
-        Normalized distortion and rate. When return_details is True,
-        also returns a dictionary containing individual normalized
-        distortions for joint optimization.
+        Normalized distortion and rate, optionally with evaluated scores.
     """
+    if isinstance(metric, dict) and active_metric not in ("both", "alex", "vgg"):
+        raise ValueError(f"Invalid active metric: {active_metric}")
+
     rgb = decode_jpeg_state(state, height, width)
 
     rgb_lpips = tensor_rgb_to_lpips(rgb)
+    details = {}
 
     if isinstance(metric, dict):
-        d_alex = (
-            metric["alex"](reference.lpips, rgb_lpips).mean()
-            / initial_distortion["alex"]
-        )
-
-        d_vgg = (
-            metric["vgg"](reference.lpips, rgb_lpips).mean() / initial_distortion["vgg"]
-        )
-
-        distortion = torch.maximum(d_alex, d_vgg)
+        if active_metric == "both":
+            d_alex = (
+                metric["alex"](reference.lpips, rgb_lpips).mean()
+                / initial_distortion["alex"]
+            )
+            d_vgg = (
+                metric["vgg"](reference.lpips, rgb_lpips).mean()
+                / initial_distortion["vgg"]
+            )
+            distortion = torch.maximum(d_alex, d_vgg)
+            if return_details:
+                details = {"alex_norm": d_alex, "vgg_norm": d_vgg}
+        else:
+            distortion = (
+                metric[active_metric](reference.lpips, rgb_lpips).mean()
+                / initial_distortion[active_metric]
+            )
     else:
         distortion = metric(reference.lpips, rgb_lpips).mean() / initial_distortion
 
     rate = jpeg_rate_proxy(state) / initial_rate
 
     if return_details:
-        details = {}
-
-        if isinstance(metric, dict):
-            details = {
-                "alex_norm": d_alex,
-                "vgg_norm": d_vgg,
-            }
-
         return distortion, rate, details
-
     return distortion, rate
 
 
@@ -458,6 +457,9 @@ def optimize_jpeg(
     max_grad_norm: float | None = None,
     verbose: bool = True,
     cache_lpips: bool = True,
+    adaptive_lpips: bool = False,
+    metric_check_every: int = 10,
+    metric_switch_threshold: float = 0.02,
 ) -> tuple[list[dict], list[dict]]:
     """Optimize JPEG coefficients and quantization tables using Adam.
 
@@ -474,20 +476,22 @@ def optimize_jpeg(
             metric: Single LPIPS model or dictionary containing Alex and VGG
                 models. Networks are frozen automatically.
             lambda_rd: Weight applied to normalized rate.
-            distortion_scale: Optional normalization scale for LPIPS.
-                Use a positive scalar for single-network optimization or a
-                dictionary with separate Alex and VGG scales for joint mode.
-                Defaults to the initial distortion, floored at DISTORTION_FLOOR.
-                Explicitly provided scales are not clamped.
             steps: Number of Adam optimization steps.
             lr: Adam learning rate.
             snapshot_every: Interval for exporting and evaluating JPEGs.
             seed: Random seed used for parameter dithering.
             max_grad_norm: Optional gradient clipping threshold.
             verbose: Print optimization progress.
-            cache_lpips: Cache LPIPS reference features to accelerate optimization.
-                Enabled by default.
-
+            cache_lpips: Cache reference-image LPIPS features.
+            adaptive_lpips: Enable adaptive scheduling for joint Alex/VGG.
+            metric_check_every: Steps between mandatory joint evaluations.
+            metric_switch_threshold: Relative normalized gap below which
+                both networks are evaluated at every step.
+            distortion_scale: Optional normalization scale for LPIPS.
+                Use a positive scalar for single-network optimization or a
+                dictionary with separate Alex and VGG scales for joint mode.
+                Defaults to the initial distortion, floored at DISTORTION_FLOOR.
+                Explicitly provided scales are not clamped.
         Returns:
             Tuple containing the final trainable state and snapshot history.
     """
@@ -508,6 +512,17 @@ def optimize_jpeg(
             raise ValueError("max_grad_norm must be positive and finite.")
 
     prepare_metrics(metric)
+    if adaptive_lpips and not isinstance(metric, dict):
+        raise ValueError("Adaptive LPIPS requires joint Alex/VGG optimization.")
+
+    if adaptive_lpips:
+        # Validate settings even when no optimizer steps are requested.
+        scheduler = AdaptiveLPIPSScheduler(
+            check_every=metric_check_every,
+            threshold=metric_switch_threshold,
+        )
+    else:
+        scheduler = None
 
     if isinstance(metric, dict):
         objective_metric = {
@@ -647,7 +662,6 @@ def optimize_jpeg(
 
         print(f"JPEG Overdrive | Adam | {device.type.upper()}")
         print(f"LPIPS feature caching: {'enabled' if cache_lpips else 'disabled'}")
-
         print(
             f"Image: {width}x{height} | "
             f"Components: {len(state)} | "
@@ -662,6 +676,15 @@ def optimize_jpeg(
             )
         else:
             scale_text = f"{distortion_scale:.6g}"
+
+        if scheduler is not None:
+            print(
+                f"Adaptive LPIPS: enabled | "
+                f"Check every: {metric_check_every} | "
+                f"Threshold: {metric_switch_threshold:.2%}"
+            )
+        else:
+            print("Adaptive LPIPS: disabled")
 
         print(f"Distortion scale: {scale_text} | Rate scale: {rate_scale.item():.6g}")
 
@@ -699,7 +722,9 @@ def optimize_jpeg(
         if step > 0:
             optimizer.zero_grad(set_to_none=True)
 
-            d_norm, r_norm = compute_objectives(
+            active_metric = scheduler.select(step) if scheduler else "both"
+
+            d_norm, r_norm, details = compute_objectives(
                 state,
                 reference,
                 objective_metric,
@@ -707,7 +732,15 @@ def optimize_jpeg(
                 rate_scale,
                 height,
                 width,
+                active_metric=active_metric,
+                return_details=True,
             )
+
+            if scheduler is not None and active_metric == "both":
+                scheduler.update(
+                    details["alex_norm"].detach().item(),
+                    details["vgg_norm"].detach().item(),
+                )
             loss = d_norm + lambda_rd * r_norm
 
             if not bool(torch.isfinite(loss).detach()):
@@ -751,6 +784,7 @@ def optimize_jpeg(
                 rate_scale,
                 height,
                 width,
+                active_metric="both",
                 return_details=True,
             )
 

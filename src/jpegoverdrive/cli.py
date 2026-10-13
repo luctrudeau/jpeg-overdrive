@@ -156,6 +156,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable LPIPS reference-feature caching.",
     )
 
+    optimize_parser.add_argument(
+        "--adaptive-lpips",
+        action="store_true",
+        help="Enable adaptive Alex/VGG metric scheduling.",
+    )
+
+    optimize_parser.add_argument(
+        "--metric-check-every",
+        type=int,
+        default=10,
+        help="Reevaluate both LPIPS networks every N steps.",
+    )
+
+    optimize_parser.add_argument(
+        "--metric-switch-threshold",
+        type=float,
+        default=0.02,
+        help="Relative normalized distortion gap for joint evaluation.",
+    )
+
     return parser
 
 
@@ -529,6 +549,9 @@ def run_optimize(args: argparse.Namespace) -> None:
         snapshot_every=args.snapshot_every,
         seed=args.seed,
         cache_lpips=getattr(args, "cache_lpips", True),
+        adaptive_lpips=getattr(args, "adaptive_lpips", False),
+        metric_check_every=getattr(args, "metric_check_every", 10),
+        metric_switch_threshold=getattr(args, "metric_switch_threshold", 0.02),
     )
 
     # Validate the actual step-0 bitstream against the baseline.
@@ -600,6 +623,9 @@ def run_optimize(args: argparse.Namespace) -> None:
             "device": str(device),
             "net": args.net,
             "cache_lpips": getattr(args, "cache_lpips", True),
+            "adaptive_lpips": getattr(args, "adaptive_lpips", False),
+            "metric_check_every": getattr(args, "metric_check_every", 10),
+            "metric_switch_threshold": getattr(args, "metric_switch_threshold", 0.02),
         },
         "selection": (
             "best_max_normalized_lpips_at_or_below_baseline_size"
